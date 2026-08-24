@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Secrets & local configuration
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Generated data -- regenerate with `helios seed`
+# ---------------------------------------------------------------------------
+data/upstream/*
+data/landing/*
+!data/upstream/.gitkeep
+!data/landing/.gitkeep
+*.parquet
+*.ndjson
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Editors, OS, local artefacts
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+logs/
+*.log
+pgdata/
