@@ -1,0 +1,113 @@
+# =============================================================================
+# Local stack: PostgreSQL + the simulated upstream API + the pipeline.
+#
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Three services because that is the real shape of the problem: the database,
+# a third-party API the pipeline does not control, and the pipeline itself.
+# Collapsing the API into the pipeline would remove exactly the part that makes
+# the retry and pagination logic worth having.
+#
+# The `pipeline` service seeds, initialises and runs once, then exits. Run
+# anything else on demand:
+#
+#   docker compose run --rm pipeline ingest --source weather
+#   docker compose run --rm pipeline watermarks
+#   docker compose run --rm pipeline dlq show
+#   docker compose run --rm pipeline backfill meter_readings --since 2026-01-01T00:00:00Z
+#
+# No credential is hard-coded: every value comes from .env, which is
+# git-ignored. The defaults after `:-` are obviously-local placeholders.
+# =============================================================================
+
+x-database-env: &database-env
+  HELIOS_DB_HOST: postgres
+  HELIOS_DB_PORT: 5432
+  HELIOS_DB_NAME: ${HELIOS_DB_NAME:-helios}
+  HELIOS_DB_USER: ${HELIOS_DB_USER:-helios_app}
+  HELIOS_DB_PASSWORD: ${HELIOS_DB_PASSWORD:-change_me_local_only}
+  HELIOS_LOG_LEVEL: ${HELIOS_LOG_LEVEL:-INFO}
+  HELIOS_LOG_FORMAT: ${HELIOS_LOG_FORMAT:-text}
+  HELIOS_PROJECT_ROOT: /app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: helios-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${HELIOS_DB_NAME:-helios}
+      POSTGRES_USER: ${HELIOS_DB_USER:-helios_app}
+      POSTGRES_PASSWORD: ${HELIOS_DB_PASSWORD:-change_me_local_only}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${HELIOS_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # The pipeline waits on this. Starting a load against a database that is
+      # still initialising is the classic compose race condition.
+      test: ["CMD-SHELL", "pg_isready -U ${HELIOS_DB_USER:-helios_app} -d ${HELIOS_DB_NAME:-helios}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # The simulated third-party metering platform. The pipeline is its client and
+  # gets no special treatment: same pagination, same rate limits, same 503s.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: helios-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      HELIOS_SOURCE_FAULT_RATE: ${HELIOS_SOURCE_FAULT_RATE:-0.15}
+      HELIOS_SOURCE_RATE_LIMIT_RATE: ${HELIOS_SOURCE_RATE_LIMIT_RATE:-0.05}
+    ports:
+      - "${HELIOS_API_PORT:-8000}:8000"
+    volumes:
+      # Shares the data directory with the pipeline: the API serves the
+      # upstream store that `helios seed` writes.
+      - ./data:/app/data
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: helios-pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      # Inside the compose network the API is reachable by service name,
+      # whatever port is published on the host.
+      HELIOS_API_BASE_URL: http://api:8000
+      HELIOS_RANDOM_SEED: ${HELIOS_RANDOM_SEED:-20260215}
+      HELIOS_N_SITES: ${HELIOS_N_SITES:-40}
+      HELIOS_N_METERS: ${HELIOS_N_METERS:-60}
+      HELIOS_HISTORY_DAYS: ${HELIOS_HISTORY_DAYS:-30}
+      HELIOS_LATE_ARRIVAL_GRACE_MINUTES: ${HELIOS_LATE_ARRIVAL_GRACE_MINUTES:-90}
+    volumes:
+      - ./data:/app/data
+    command: ["all"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+    driver: local
