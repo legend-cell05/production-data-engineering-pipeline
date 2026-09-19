@@ -142,6 +142,17 @@ classified AS (
                   * GREATEST(1.0, m.span_minutes::NUMERIC / NULLIF(m.interval_minutes, 0))
                 THEN 'rollover'
             WHEN m.index_kwh < m.previous_index THEN 'reset'
+            -- A forward step far beyond what this meter normally does in the
+            -- time elapsed. Judged against the median rather than the p95:
+            -- one corrupt value inflates its own p95 enough to make itself
+            -- look normal, which is exactly the value this branch exists to
+            -- catch. Classified here rather than in the final SELECT so that
+            -- `valued` can null the consumption -- a flag that leaves the
+            -- number in the column is a flag nobody downstream honours.
+            WHEN m.median_delta_kwh > 0
+             AND (m.index_kwh - m.previous_index) > 25 * m.median_delta_kwh
+                  * GREATEST(1.0, m.span_minutes::NUMERIC / NULLIF(m.interval_minutes, 0))
+                THEN 'implausible'
             ELSE 'forward'
         END AS step_kind
     FROM measured m
@@ -152,6 +163,7 @@ valued AS (
         CASE c.step_kind
             WHEN 'first_reading' THEN NULL
             WHEN 'reset'         THEN NULL
+            WHEN 'implausible'   THEN NULL
             WHEN 'rollover'      THEN c.wrapped_delta
             -- The index did not really move. Zero understates by less than one
             -- interval's consumption, which is the smallest honest answer
@@ -180,12 +192,9 @@ SELECT
         WHEN v.step_kind = 'rollover'      THEN 'rollover'
         WHEN v.step_kind = 'reset'         THEN 'reset'
         WHEN v.step_kind = 'correction'    THEN 'correction'
-        -- A forward step far beyond what this meter normally does in the time
-        -- elapsed. Kept, flagged, and excluded from totals: a value that large
-        -- is a data problem, not a consumption event.
-        WHEN v.median_delta_kwh > 0
-         AND v.consumption_kwh > 25 * v.median_delta_kwh * v.interval_factor
-                                           THEN 'implausible'
+        -- Kept as a row, flagged, and excluded from every total: a value that
+        -- large is a data problem, not a consumption event.
+        WHEN v.step_kind = 'implausible'   THEN 'implausible'
         WHEN v.span_minutes > CAST(:interval_minutes AS INT) * 1.5 THEN 'gap'
         WHEN v.consumption_kwh = 0         THEN 'flat'
         ELSE 'ok'
