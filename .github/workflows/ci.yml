@@ -1,0 +1,321 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Static analysis -- fast, no database, fails the pipeline early.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: python -m ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: python -m ruff format --check .
+
+      - name: mypy
+        run: python -m mypy
+
+  # ---------------------------------------------------------------------------
+  # 2. Tests -- unit tests on every supported Python, integration tests against
+  #    a real PostgreSQL service container. The SQL *is* the thing under test
+  #    here (partitioning, window functions, upserts); mocking it would prove
+  #    nothing.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: helios_test
+          POSTGRES_USER: helios_app
+          # Test-only credential for an ephemeral container destroyed with the
+          # job and unreachable from outside the runner.
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U helios_app -d helios_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      HELIOS_DB_HOST: localhost
+      HELIOS_DB_PORT: 5432
+      HELIOS_DB_NAME: helios_test
+      HELIOS_DB_USER: helios_app
+      HELIOS_DB_PASSWORD: ci_test_password
+      HELIOS_RUN_INTEGRATION: "1"
+      HELIOS_LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Wait for PostgreSQL
+        run: python -m helios.cli doctor
+
+      - name: Unit tests
+        run: python -m pytest tests/unit -v --junitxml=junit-unit.xml
+
+      - name: Integration tests
+        run: python -m pytest tests/integration -v --junitxml=junit-integration.xml
+
+      - name: Coverage
+        if: matrix.python-version == '3.12'
+        run: python -m pytest tests --cov --cov-report=xml --cov-report=term-missing
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            junit-*.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 3. End-to-end -- the pipeline must actually ingest over HTTP, load a
+  #    warehouse, and prove the properties the README claims: idempotency, a
+  #    working backfill, and a dead-letter queue that fills.
+  # ---------------------------------------------------------------------------
+  pipeline:
+    name: End-to-end pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [lint]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: helios
+          POSTGRES_USER: helios_app
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U helios_app -d helios"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      HELIOS_DB_HOST: localhost
+      HELIOS_DB_PORT: 5432
+      HELIOS_DB_NAME: helios
+      HELIOS_DB_USER: helios_app
+      HELIOS_DB_PASSWORD: ci_test_password
+      HELIOS_API_BASE_URL: http://localhost:8000
+      HELIOS_LOG_LEVEL: INFO
+      # Smaller than the default so the job stays quick; the shape of the data
+      # is identical.
+      HELIOS_N_SITES: "15"
+      HELIOS_N_METERS: "20"
+      HELIOS_HISTORY_DAYS: "7"
+      # Faults stay ON: a retry policy that has never retried anything in CI is
+      # a retry policy nobody has tested.
+      HELIOS_SOURCE_FAULT_RATE: "0.15"
+      HELIOS_SOURCE_RATE_LIMIT_RATE: "0.05"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Generate the simulated upstream
+        run: python -m helios.cli seed
+
+      - name: Start the upstream API
+        run: |
+          nohup python -m helios.cli serve --host 127.0.0.1 --port 8000 > api.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "API is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "API did not start"; cat api.log; exit 1
+
+      - name: Initialise the warehouse
+        run: python -m helios.cli init-db
+
+      - name: Run the pipeline
+        run: python -m helios.cli run
+
+      - name: Watermarks, partitions and dead letters
+        run: |
+          python -m helios.cli watermarks
+          python -m helios.cli partitions
+          python -m helios.cli dlq show
+
+      - name: Prove idempotency
+        run: |
+          python -m helios.cli run
+          python - <<'PY'
+          from sqlalchemy import text
+          from helios.config import get_settings
+          from helios.db.engine import get_engine
+
+          settings = get_settings()
+          with get_engine(settings).connect() as conn:
+              duplicates = conn.execute(text(
+                  f"SELECT COUNT(*) FROM (SELECT meter_id, reading_ts "
+                  f"FROM {settings.core_schema}.meter_reading "
+                  f"GROUP BY meter_id, reading_ts HAVING COUNT(*) > 1) d"
+              )).scalar_one()
+              unknown = conn.execute(text(
+                  f"SELECT COUNT(*) FROM {settings.core_schema}.meter_reading_default"
+              )).scalar_one()
+          assert duplicates == 0, f"{duplicates} duplicated readings after a second run"
+          assert unknown == 0, f"{unknown} readings landed in the default partition"
+          print("idempotency verified: no duplicated reading, no unpartitioned row")
+          PY
+
+      - name: Prove the backfill is safe
+        run: |
+          python - <<'PY'
+          import datetime as dt, subprocess, sys
+          since = (dt.datetime.now(dt.UTC) - dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+          sys.exit(subprocess.call([
+              sys.executable, "-m", "helios.cli", "backfill", "meter_readings", "--since", since
+          ]))
+          PY
+          python - <<'PY'
+          from sqlalchemy import text
+          from helios.config import get_settings
+          from helios.db.engine import get_engine
+
+          settings = get_settings()
+          with get_engine(settings).connect() as conn:
+              duplicates = conn.execute(text(
+                  f"SELECT COUNT(*) FROM (SELECT meter_id, reading_ts "
+                  f"FROM {settings.core_schema}.meter_reading "
+                  f"GROUP BY meter_id, reading_ts HAVING COUNT(*) > 1) d"
+              )).scalar_one()
+          assert duplicates == 0, "backfill duplicated readings"
+          print("backfill verified: no duplication, watermark intact")
+          PY
+
+      - name: Check the dead-letter queue actually filled
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+          from helios.config import get_settings
+          from helios.db.engine import get_engine
+
+          settings = get_settings()
+          with get_engine(settings).connect() as conn:
+              parked = conn.execute(text(
+                  f"SELECT COUNT(*) FROM {settings.meta_schema}.dead_letter"
+              )).scalar_one()
+          # The generator injects contract violations on purpose. Zero here
+          # would mean the contract is not being applied at all.
+          assert parked > 0, "no records were dead-lettered -- is the contract being applied?"
+          print(f"dead-letter queue verified: {parked} record(s) parked with a cause")
+          PY
+
+      - name: Data-quality gate
+        run: python -m helios.cli quality
+
+      - name: Pipeline observability endpoints
+        run: |
+          curl -fsS http://localhost:8000/pipeline/health | head -c 400; echo
+          curl -fsS http://localhost:8000/pipeline/watermarks | head -c 400; echo
+          curl -fsS http://localhost:8000/pipeline/metrics | head -40
+
+      - name: Upload the API log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-log
+          path: api.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 4. Container build -- built and smoke-tested, never pushed.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: production-data-engineering-pipeline:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm production-data-engineering-pipeline:ci --version
+          docker run --rm production-data-engineering-pipeline:ci contracts
+          # The image must not run as root.
+          test "$(docker run --rm --entrypoint id production-data-engineering-pipeline:ci -u)" != "0"
