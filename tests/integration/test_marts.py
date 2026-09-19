@@ -196,6 +196,11 @@ class TestDeltaClassification:
     def test_large_forward_jump_is_implausible(self, controlled_warehouse: Settings) -> None:
         row = _rows(controlled_warehouse)[135]
         assert row["delta_flag"] == "implausible"
+        # Regression: the flag used to be applied after the value had been
+        # computed, so the row kept its absurd delta and only the views that
+        # filtered on the flag were correct. A flag that does not change the
+        # number is a flag nobody downstream honours.
+        assert row["consumption_kwh"] is None
 
     def test_unexplained_backward_step_is_a_reset_with_null_consumption(
         self, controlled_warehouse: Settings
@@ -213,6 +218,25 @@ class TestDeltaClassification:
             if r["consumption_kwh"] is not None
         ]
         assert all(float(v) >= 0 for v in values)
+
+    def test_an_unfiltered_sum_matches_the_usable_total(
+        self, controlled_warehouse: Settings
+    ) -> None:
+        """A plain SUM over the table must not be corrupted by flagged rows.
+
+        Every unusable flag stores NULL rather than a number, so an analyst who
+        forgets ``is_usable()`` gets the same answer as one who remembers.
+        """
+        mart = controlled_warehouse.mart_schema
+        with get_engine(controlled_warehouse).connect() as conn:
+            unfiltered = conn.execute(
+                text(
+                    f"""SELECT SUM(consumption_kwh)
+                        FROM {mart}.consumption_interval
+                        WHERE meter_id = 'M-TEST'"""
+                )
+            ).scalar_one()
+        assert float(unfiltered) == pytest.approx(280.0)
 
     def test_only_usable_flags_contribute_to_the_total(
         self, controlled_warehouse: Settings
