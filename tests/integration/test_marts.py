@@ -86,6 +86,24 @@ def controlled_warehouse(mart_settings: Settings):
         (150, 5.0),
     ]
 
+    # A SECOND meter, deliberately kept apart from the one above: its history
+    # is corrupt, and the per-meter statistics of a corrupt meter must not be
+    # allowed to change how a healthy meter is classified.
+    #
+    #  #  offset(min)  index        what it represents
+    #  0        0        1_000.0    start
+    #  1       15        1_050.0    clean step of 50
+    #  2       30        1_100.0    clean step of 50
+    #  3       45    9_000_000.0    CORRUPT: beyond the register's capacity
+    #  4       60          100.0    backwards from a corrupt index -- NOT a wrap
+    corrupt_readings = [
+        (0, 1_000.0),
+        (15, 1_050.0),
+        (30, 1_100.0),
+        (45, 9_000_000.0),
+        (60, 100.0),
+    ]
+
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -105,25 +123,40 @@ def controlled_warehouse(mart_settings: Settings):
                     ON CONFLICT (meter_id) DO NOTHING"""
             )
         )
-        for offset, index in readings:
-            conn.execute(
-                text(
-                    f"""INSERT INTO {core}.meter_reading
-                        (meter_id, reading_ts, index_kwh, quality_flag,
-                         source_updated_at, batch_id)
-                        VALUES ('M-TEST', :ts, :idx, 'measured', :ts, CAST(:b AS UUID))
-                        ON CONFLICT (meter_id, reading_ts) DO NOTHING"""
-                ),
-                {"ts": BASE + dt.timedelta(minutes=offset), "idx": index, "b": batch},
+        conn.execute(
+            text(
+                f"""INSERT INTO {core}.meter
+                    (meter_id, site_id, meter_type, unit, multiplier, index_digits,
+                     interval_minutes, is_active, source_updated_at)
+                    VALUES ('M-CORRUPT', 'S-TEST', 'submeter', 'kWh', 1, 6, 15, TRUE, now())
+                    ON CONFLICT (meter_id) DO NOTHING"""
             )
+        )
+        for meter, series in (("M-TEST", readings), ("M-CORRUPT", corrupt_readings)):
+            for offset, index in series:
+                conn.execute(
+                    text(
+                        f"""INSERT INTO {core}.meter_reading
+                            (meter_id, reading_ts, index_kwh, quality_flag,
+                             source_updated_at, batch_id)
+                            VALUES (:m, :ts, :idx, 'measured', :ts, CAST(:b AS UUID))
+                            ON CONFLICT (meter_id, reading_ts) DO NOTHING"""
+                    ),
+                    {
+                        "m": meter,
+                        "ts": BASE + dt.timedelta(minutes=offset),
+                        "idx": index,
+                        "b": batch,
+                    },
+                )
 
     refresh_consumption(BASE.date(), BASE.date(), mart_settings)
     yield mart_settings
     drop_schemas(mart_settings)
 
 
-def _rows(settings: Settings) -> dict[int, dict[str, object]]:
-    """The mart rows, keyed by minutes since BASE."""
+def _rows(settings: Settings, meter: str = "M-TEST") -> dict[int, dict[str, object]]:
+    """One meter's mart rows, keyed by minutes since BASE."""
     with get_engine(settings).connect() as conn:
         result = (
             conn.execute(
@@ -131,9 +164,10 @@ def _rows(settings: Settings) -> dict[int, dict[str, object]]:
                     f"""SELECT reading_ts, index_kwh, previous_index, consumption_kwh,
                            span_minutes, delta_flag
                     FROM {settings.mart_schema}.consumption_interval
-                    WHERE meter_id = 'M-TEST'
+                    WHERE meter_id = :meter
                     ORDER BY reading_ts"""
-                )
+                ),
+                {"meter": meter},
             )
             .mappings()
             .all()
@@ -201,6 +235,41 @@ class TestDeltaClassification:
         # filtered on the flag were correct. A flag that does not change the
         # number is a flag nobody downstream honours.
         assert row["consumption_kwh"] is None
+
+    def test_a_reading_beyond_the_register_is_implausible(
+        self, controlled_warehouse: Settings
+    ) -> None:
+        """9 000 000 on a register that holds 1 000 000 is not a measurement."""
+        row = _rows(controlled_warehouse, "M-CORRUPT")[45]
+        assert row["delta_flag"] == "implausible"
+        assert row["consumption_kwh"] is None
+
+    def test_a_backward_step_from_a_corrupt_index_is_not_a_rollover(
+        self, controlled_warehouse: Settings
+    ) -> None:
+        """Regression: a wrap must produce a POSITIVE delta.
+
+        With the previous index beyond the register, (register_max - previous)
+        + index is negative, and a bare "is it below the plausibility
+        threshold?" test accepts it -- every negative number is below every
+        positive threshold. The row was classified as a rollover and carried a
+        consumption of -147 646 693 kWh, which the CHECK constraint on
+        consumption_interval refused, failing the whole refresh.
+        """
+        row = _rows(controlled_warehouse, "M-CORRUPT")[60]
+        assert row["delta_flag"] == "reset"
+        assert row["consumption_kwh"] is None
+
+    def test_no_interval_carries_a_negative_consumption(
+        self, controlled_warehouse: Settings
+    ) -> None:
+        negatives = [
+            (meter, offset)
+            for meter in ("M-TEST", "M-CORRUPT")
+            for offset, row in _rows(controlled_warehouse, meter).items()
+            if row["consumption_kwh"] is not None and float(row["consumption_kwh"]) < 0
+        ]
+        assert negatives == []
 
     def test_unexplained_backward_step_is_a_reset_with_null_consumption(
         self, controlled_warehouse: Settings

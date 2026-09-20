@@ -305,6 +305,26 @@ document says so.
 zero: zero is a measurement, `NULL` is the absence of one, and summing zeros
 understates a total silently.
 
+**A fourth and fifth bug, found by the CHECK constraint and by the test that
+the fourth one broke.** A corrupted reading can put a meter's index *beyond its
+own register's capacity*. The wrapped delta `(register_max - previous) + index`
+is then negative, and the plausibility test -- "is the wrapped delta below the
+threshold?" -- accepts it, because every negative number is below every
+positive threshold. The row was classified `rollover` and carried
+-147 646 693 kWh, which `ck_consumption_nonneg` refused, failing the whole
+refresh. A wrap must produce a positive delta; the guard is now explicit and
+such a step falls through to `reset`.
+
+Adding that case to the hand-built fixture then broke three passing tests, and
+the reason was the fifth bug: the corrupt reading's own delta was included in
+the `PERCENTILE_CONT(0.95)` that judges every other step of that meter. One
+index of nine million on a meter that moves by fifty lifts the p95 above every
+real step, and the meter's genuine backward steps all start looking like small
+corrections. The statistic meant to judge the outlier was being dictated by it.
+The p95 is now computed only over deltas the median already considers sane, and
+the corrupt meter lives in its own fixture -- a test must not alter the data it
+measures.
+
 **A third bug, found while writing this document.** `implausible` was being
 decided in the final `SELECT`, *after* the value had already been computed --
 so the row was flagged and kept its 5 · 10⁸ kWh delta. Every view that filtered
