@@ -84,7 +84,12 @@ quote-style = "double"
 # mypy
 # ---------------------------------------------------------------------------
 [tool.mypy]
-python_version = "3.11"
+# No `python_version` pin on purpose. Pinning it to the oldest supported
+# runtime makes mypy apply that version's grammar to the *dependencies'* stubs
+# too, and numpy >= 2.5 ships stubs written with PEP 695 `type` statements --
+# which mypy rejects as a syntax error under 3.11, before it has looked at a
+# single line of this project. Mypy therefore follows the interpreter it runs
+# under; running on 3.11 is still exercised by the test matrix.
 files = ["src"]
 warn_unused_ignores = true
 warn_redundant_casts = true
