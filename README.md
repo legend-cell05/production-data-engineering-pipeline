@@ -171,7 +171,7 @@ Full diagrams, the ingestion sequence and the performance numbers are in
 | Simulated source | FastAPI + Uvicorn | Real HTTP, real pagination, real 503s |
 | HTTP client | httpx | Timeouts and connection pooling |
 | CLI | Typer + Rich | One command per pipeline task |
-| Tests | pytest | 133 tests, 84 unit + 49 integration |
+| Tests | pytest | 136 tests, 84 unit + 52 integration |
 | Quality | Ruff, mypy | Both clean, enforced in CI |
 | Container | Docker multi-stage | Non-root UID 10001, asserted in CI |
 | CI | GitHub Actions | Lint, test matrix, end-to-end pipeline, image build |
@@ -421,6 +421,13 @@ inspection:
   that filtered on the flag were right and a plain `SUM` was wrong by a factor
   of fifty. A flag that does not change the number is a flag nobody downstream
   honours; there is now a test asserting the unfiltered sum.
+- A `CHECK` constraint caught a **negative** consumption: a corrupted index
+  beyond its register's capacity makes the wrapped delta negative, and
+  "is it below the threshold?" accepts every negative number. Caught in CI, not
+  locally — the generated data only produces the case on some dates.
+- Adding that case to the fixture exposed one more: the corrupt reading was
+  included in the p95 that judges its own meter's other steps, so the statistic
+  meant to detect the outlier was dictated by it.
 
 Both fixes are written up in [docs/decisions.md](docs/decisions.md). They are in
 the README because "the checks caught something real" is the only evidence that
@@ -459,8 +466,8 @@ make check              # lint + typecheck + unit tests
 | | Count |
 | --- | --- |
 | Unit tests | 84 |
-| Integration tests | 49 |
-| **Total** | **133** |
+| Integration tests | 52 |
+| **Total** | **136** |
 
 The integration tests run against a **real** PostgreSQL, not a mock. The SQL is
 the thing under test here — partitioning, window functions, upserts, the
@@ -564,7 +571,7 @@ Interval classification across 166 835 readings:
 | 163 478 | 2 057 | 1 095 | 59 | 60 | 56 | 27 | 3 |
 
 Static analysis and tests: ruff clean, `ruff format` clean, mypy clean across 39
-source files, 133 tests passing.
+source files, 136 tests passing.
 
 These are single-machine figures from one container, not a benchmark. They are
 here because "fast" without a number is not a claim.

@@ -94,12 +94,9 @@ with_previous AS (
 --          percentile is the wrong tool for that: one corrupt value of a
 --          million inflates the p95 enough to make itself look normal, which
 --          is precisely the value the check exists to catch.
-meter_scale AS (
+meter_median AS (
     SELECT
         meter_id,
-        PERCENTILE_CONT(0.95) WITHIN GROUP (
-            ORDER BY (index_kwh - previous_index)
-        ) AS p95_delta_kwh,
         PERCENTILE_CONT(0.50) WITHIN GROUP (
             ORDER BY (index_kwh - previous_index)
         ) AS median_delta_kwh
@@ -107,6 +104,28 @@ meter_scale AS (
     WHERE previous_index IS NOT NULL
       AND index_kwh >= previous_index
     GROUP BY meter_id
+),
+-- The p95 is computed only over deltas the median already considers sane.
+-- Without that filter a single corrupt reading -- one index of nine million on
+-- a meter that moves by fifty -- lifts the p95 above every real step, and the
+-- meter's own backward steps then all look like "small corrections". The
+-- statistic meant to judge the outlier ends up dictated by it.
+meter_scale AS (
+    SELECT
+        p.meter_id,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (
+            ORDER BY (p.index_kwh - p.previous_index)
+        ) AS p95_delta_kwh,
+        MAX(mm.median_delta_kwh) AS median_delta_kwh
+    FROM with_previous p
+    JOIN meter_median mm ON mm.meter_id = p.meter_id
+    WHERE p.previous_index IS NOT NULL
+      AND p.index_kwh >= p.previous_index
+      AND (
+            mm.median_delta_kwh <= 0
+         OR (p.index_kwh - p.previous_index) <= 100 * mm.median_delta_kwh
+          )
+    GROUP BY p.meter_id
 ),
 measured AS (
     SELECT
@@ -136,8 +155,15 @@ classified AS (
              AND (m.previous_index - m.index_kwh) <= m.p95_delta_kwh
                   * GREATEST(1.0, m.span_minutes::NUMERIC / NULLIF(m.interval_minutes, 0))
                 THEN 'correction'
+            -- A wrap must produce a POSITIVE delta. When a corrupted reading
+            -- puts the previous index beyond the register's own capacity,
+            -- (register_max - previous) + index goes negative, and a bare
+            -- "is it below the threshold?" test accepts it -- every negative
+            -- number is. Such a step is not a wrap; it falls through to
+            -- 'reset' and its consumption is NULL.
             WHEN m.index_kwh < m.previous_index
              AND m.p95_delta_kwh > 0
+             AND m.wrapped_delta > 0
              AND m.wrapped_delta <= 10 * m.p95_delta_kwh
                   * GREATEST(1.0, m.span_minutes::NUMERIC / NULLIF(m.interval_minutes, 0))
                 THEN 'rollover'
